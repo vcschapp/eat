@@ -1,5 +1,10 @@
-use std::error::Error;
+use std::cell::RefCell;
+use std::cmp;
+use std::collections::TryReserveError;
+use std::error;
+use std::fmt;
 use std::io::Read;
+use std::rc::Rc;
 
 // TODO: Delete
 pub fn add(left: u64, right: u64) -> u64 {
@@ -35,36 +40,66 @@ pub static KEY_NULL: &str = "null";
 
 /// Position of token or error within a JSON input stream. This position is relative to the start of
 /// the [Stream], not the [Buf].
-#[derive(Default, Clone, Copy)]
-struct Pos {
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Pos {
     pub byte_off: u64,
     pub char_off: u64,
     pub line: u64,
     pub col: u64,
 }
 
-// Category of JSON error.
-pub enum JSONErrorCat {
-    /// Lexical error. May be produced either type of [Stream], [Lex] or
-    /// [Syn].
+impl fmt::Display for Pos {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "line {}, column {}, byte {}",
+            self.line, self.col, self.byte_off,
+        )
+    }
+}
+
+/// Category of JSON error.
+#[derive(Debug, Clone, Copy)]
+pub enum ErrorCat {
+    /// Read error in underlying stream.
+    Read,
+    /// Lexical error in JSON.
     Lex,
-    /// Syntactic error. Only produced by [Syn], as a [Lex] does not
-    /// check JSON syntax.
-    Syn,
 }
 
-/// Error representing invalid JSON.
-pub struct JSONError {
-    pub cat: JSONErrorCat,
+/// Represents either an error reading the underlying stream
+/// ([ErrorCat::Read]) or a lexical error when tokenizing the JSON
+/// ([ErrorCat::Lex]).
+#[derive(Debug, Clone)]
+pub struct Error {
+    pub cat: ErrorCat,
+    pub desc: String,
     pub pos: Pos,
+    source: Option<Rc<dyn error::Error + 'static>>,
 }
 
-impl Error for JSONError {
-    // TODO - Implement std::error::Error so cause information can be
-    // tracked for things like unexpected EOF.
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let prefix = match self.cat {
+            ErrorCat::Read => "read",
+            ErrorCat::Lex => "lexical",
+        };
+        write!(f, "{} error: {} at {}", prefix, self.desc, self.pos)?;
+        if let Some(source) = self.source.as_ref() {
+            write!(f, ": caused by {}", source)?;
+        }
+        Ok(())
+    }
+}
+
+impl error::Error for Error {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        self.source.as_ref().map(|rc| rc.as_ref())
+    }
 }
 
 /// A JSON token read from a [Buf].
+#[derive(Debug)]
 pub enum Tok<'a> {
     /// Separator token.
     ///
@@ -100,10 +135,15 @@ pub enum Tok<'a> {
     /// - [KEY_NULL]
     Key(&'static str),
 
+    /// Whitespace token.
+    ///
+    /// Contains a JSON whitespace token literally as it appears in the JSON input.
+    White(&'a str),
+
     /// End of usable input tokens.
     ///
     /// After all usable input has been consumed in the buffer, there may still be more unusable
-    /// input in the form of partial tokens. This unusable remainder, if any, is included with the
+    /// input in the form of a partial token. This unusable remainder, if any, is included with the
     /// token.
     End(&'a str),
 
@@ -111,46 +151,216 @@ pub enum Tok<'a> {
     ///
     /// Indicates that a lexical or syntactic error was detected. Includes the error details,
     /// including its position within the buffer.
-    Err(JSONError),
+    Err(Error),
 }
 
-pub trait Stream<'a> {
-    // TODO: Need a way to indicate no more bufs!
-    fn next(&mut self) -> Option<&'a impl Buf>;
-    fn pos(&self) -> Pos;
-}
+/// Default value for the initial capacity of a [Buf], in bytes. This
+/// value will be used as the starting buffer size in a [Stream] unless
+/// overridden with [StreamBuilder::init_buf_len].
+const DEFAULT_INIT_BUF_LEN: usize = 4 * 1024;
 
-pub trait Buf: Drop {
-    fn next(&mut self) -> Tok;
-    fn pos(&self) -> Pos;
-}
+/// Default value for the maximum capacity of a [Buf], in bytes. This
+/// will be used as the maximum possible buffer size in a [Stream]
+/// unless overridden with [StreamBuilder::max_buf_len].
+const DEFAULT_MAX_BUF_LEN: usize = 8 * 1024 * 1024;
 
-pub struct Lex<'a, R>
+/// Maximum possible value for the maximum capacity of a [Buf], in
+/// bytes.
+const MAX_MAX_BUF_LEN: usize = isize::MAX as usize;
+
+pub struct Stream<R>
 where
     R: Read,
 {
     reader: R,
-    pos: Pos,
-    buf: Option<LexBuf>,
+    shared: Rc<SharedBuf>,
+    max_buf_len: usize,
 }
 
-impl<'a, R> Lex<'a, R>
+impl<R> Stream<R>
 where
     R: Read,
 {
-    fn builder() -> LexBuilder<R> {
-        LexBuilder { reader: None }
+    /// Returns a new builder that can be used to build a stream.
+    pub fn builder() -> StreamBuilder<R> {
+        StreamBuilder {
+            reader: None,
+            init_buf_len: DEFAULT_INIT_BUF_LEN,
+            max_buf_len: DEFAULT_MAX_BUF_LEN,
+        }
+    }
+
+    /// Prepares the next buffer to be returned by [Self::buf].
+    ///
+    /// ### Returns
+    ///
+    /// Returns `true` if the next buffer is ready or `false` if the
+    /// stream is now exhausted. If the return value is `true`, the
+    /// buffer may be fetched by calling [Self::buf].
+    ///
+    /// ### Panics
+    ///
+    /// This function will panic if the buffer returned from the most
+    /// recent previous call to [Self::buf]:
+    /// 1. Has not been dropped.
+    /// 2. Was not fully consumed.
+    ///
+    /// ### Errors
+    ///
+    /// This function does not return an error.
+    ///
+    /// Any errors encountered reading from the underlying reader will be
+    /// reported as the first token from the [Buf] returned by [Self::buf].
+    pub fn next(&mut self) -> bool {
+        // Validate that previous buffer has been fully consumed and returned.
+        let shared =
+            Rc::get_mut(&mut self.shared).expect("Buf in use: drop current Buf before next()");
+        let data = &mut shared.data;
+        let mut meta = shared.meta.borrow_mut();
+        if meta.is_consumed {
+            panic!("Buf not fully consumed: read it up to End or Err")
+        }
+        // If the buffer has length 0, this stream is now exhausted.
+        if data.is_empty() {
+            return false;
+        }
+        // If the error or EOF has already been consumed from the buffer, this
+        // stream is now exhausted. Discard the shared buffer and return false.
+        if meta.is_eof || meta.err.is_some() {
+            data.clear();
+            return false;
+        }
+        // Read more input.
+        Stream::<R>::read(&mut self.reader, data, &mut *meta, self.max_buf_len);
+        // Indicate that there is more input to consume.
+        true
+    }
+
+    /// Returns the buffer prepared by [Self::next].
+    ///
+    /// ### Returns
+    ///
+    /// Returns a [Buf] containing JSON tokens.
+    ///
+    /// ### Panics
+    ///
+    /// This function will panic unless it is called after a call to [Self::next] that returned
+    /// `true`.
+    ///
+    /// There can be at most one call to this function per call to [Self::next], so if [Self::next]
+    /// returned `true` but this function has already been called once, a subsequent call will
+    /// panic until [Self::next] is called again returning `true`.
+    ///
+    /// ### Errors
+    ///
+    /// This function does not return an error.
+    pub fn buf(&mut self) -> Buf {
+        // Validate that this method call occurs after a call to next() that
+        // returned true, i.e. that there is a buffer available.
+        if Rc::strong_count(&self.shared) > 1 {
+            panic!("Buf in use: drop current Buf before buf()")
+        } else if self.shared.data.is_empty() {
+            panic!("next() was not called, or returned false")
+        }
+        // Return buffer.
+        let meta = self.shared.meta.borrow();
+        assert!(meta.byte_off == 0);
+        Buf {
+            shared: Rc::clone(&self.shared),
+            data_ref: &self.shared.data,
+            meta_copy: meta.clone(),
+            tok: Tok::Sep(SEP_BRACE_C),
+        }
+    }
+
+    // Moves unconsumed bytes to the front of the data buffer and tries to resize it as necessary.
+    fn shift(data: &mut Vec<u8>, meta: &mut MetaBuf, max_buf_len: usize) -> Result<usize, Error> {
+        // Count the unconsumed remainder bytes.
+        let rem = data.len() - meta.byte_off;
+        // Move any unconsumed data to the front.
+        data.copy_within(meta.byte_off.., 0);
+        // Expand the buffer if we are not making enough progress.
+        if (meta.byte_off as f32) / (data.len() as f32) < 0.5 {
+            // Calculate the desired new capacity.
+            let new_capacity = match data.len().checked_mul(2) {
+                Some(double_len) => cmp::min(cmp::max(double_len, data.capacity()), max_buf_len),
+                None => max_buf_len,
+            };
+            if data.capacity() < new_capacity {
+                // Expand the buffer. If it fails, return error message that prevented the buffer
+                // being expanded.
+                data.try_reserve(new_capacity)
+                    .map_err(|e: TryReserveError| Error {
+                        cat: ErrorCat::Read,
+                        desc: String::from("failed to expand buffer"),
+                        pos: meta.pos,
+                        source: Some(Rc::from(e)),
+                    })?;
+            } else if meta.byte_off == 0 {
+                // If the buffer is already at maximum capacity AND we failed to make ANY progress,
+                // this means there is a JSON string or number token that is larger than the buffer.
+                // Since the only thing we could possibly do is allocate a bigger buffer that would
+                // allow the whole token to be seen at once, and we can't do that, we return with an
+                // error.
+                let desc = format!(
+                    "can't make progress with maxxed buffer of {} bytes (likely due to an offensively long string or number token)",
+                    data.capacity()
+                );
+                return Err(Error {
+                    cat: ErrorCat::Read,
+                    desc: desc,
+                    pos: meta.pos,
+                    source: None,
+                });
+            }
+        }
+        // Update consumed byte offset to zero.
+        meta.byte_off = 0;
+        // Shift is successful.
+        Ok(rem)
+    }
+
+    fn read(reader: &mut R, data: &mut Vec<u8>, meta: &mut MetaBuf, max_buf_len: usize) {
+        // Move unconsumed bytes to the left and, if necessary, enlarge buffer.
+        let rem = match Stream::<R>::shift(data, meta, max_buf_len) {
+            Ok(rem) => rem,
+            Err(e) => {
+                meta.err = Some(e);
+                return;
+            }
+        };
+        // Read up to buffer capacity.
+        let capacity = data.capacity();
+        unsafe { data.set_len(capacity) }
+        match reader.read(&mut data[rem..capacity - rem]) {
+            Ok(num_read) => {
+                unsafe {
+                    data.set_len(rem + num_read);
+                }
+                meta.is_eof = num_read == 0;
+            }
+            Err(e) => {
+                meta.err = Some(Error {
+                    cat: ErrorCat::Read,
+                    desc: String::from("failed to read"),
+                    pos: meta.pos,
+                    source: Some(Rc::from(e)),
+                });
+            }
+        }
     }
 }
 
-struct LexBuilder<R>
+pub struct StreamBuilder<R>
 where
     R: Read,
 {
     reader: Option<R>,
+    init_buf_len: usize,
+    max_buf_len: usize,
 }
 
-impl<R> LexBuilder<R>
+impl<R> StreamBuilder<R>
 where
     R: Read,
 {
@@ -159,87 +369,351 @@ where
         self
     }
 
-    pub fn build(self) -> Lex<R> {
-        Lex {
+    pub fn init_buf_len(mut self, init_buf_len: usize) -> Self {
+        if init_buf_len < 1 {
+            panic!("init_buf_len must be positive");
+        } else if init_buf_len > self.max_buf_len {
+            panic!(
+                "init_buf_len must not exceed max_buf_len, but {} > {}",
+                init_buf_len, self.max_buf_len,
+            );
+        }
+        self.init_buf_len = init_buf_len;
+        self
+    }
+
+    pub fn max_buf_len(mut self, max_buf_len: usize) -> Self {
+        if max_buf_len < self.init_buf_len {
+            panic!(
+                "max_buf_len must not be less than init_buf_len, but {} < {}",
+                max_buf_len, self.init_buf_len
+            );
+        } else if max_buf_len > MAX_MAX_BUF_LEN {
+            panic!(
+                "max_buf_len must not exceed MAX_MAX_BUF_LEN, but {} > {}",
+                max_buf_len, MAX_MAX_BUF_LEN
+            );
+        }
+        self.max_buf_len = max_buf_len;
+        self
+    }
+
+    pub fn build(self) -> Stream<R> {
+        Stream {
             reader: self.reader.expect("reader not provided"),
-            pos: Pos::default(),
+            shared: Rc::new(SharedBuf::alloc(self.init_buf_len)),
+            max_buf_len: self.max_buf_len,
         }
     }
 }
 
-impl<R> Stream for Lex<R>
-where
-    R: Read,
-{
-    fn next(&mut self) -> Option<impl Buf> {
-        // Logic:
-        // 1) If there is a buffer out in use, we panic and say it needs to be
-        //    returned.
-        // 2) If there is no buffer at all, we have to allocate it.
-        // 3) Upon being returned (elsewhere), if buffer was NOT fully used then
-        //    we are quietly put into an error state that will trigger a panic
-        //    here. If it was fully used, then incomplete remainder is now copied
-        //    to the front of the buffer. If incomplete remaindert WAS at the
-        //    front of the buffer, then we have to allocate a bigger buffer.
+#[derive(Debug, Clone)]
+struct MetaBuf {
+    // Whether all usable JSON tokens have been consumed from the buffer. Once all the legitimate
+    // JSON tokens have been consumed, there may still be an unused remainder that will have to be
+    // moved to the front of the buffer.
+    is_consumed: bool,
+
+    // Whether the end of file has been seen in the input stream, meaning that this buffer now has
+    // all possible remaining input on the stream.
+    is_eof: bool,
+
+    // Byte offset into the buffer that has been consumed so far.
+    byte_off: usize,
+
+    // Read position within the overall input stream. The Stream will refresh its own position from
+    // this value when its next method is called.
+    pos: Pos,
+
+    // Fatal error to be transferred between Stream and Buf. This allows the Stream to push a read
+    // error down to the Buf and Buf to push a lexical error up to the Stream.
+    err: Option<Error>,
+}
+
+struct SharedBuf {
+    // Memory for the buffer.
+    data: Vec<u8>,
+
+    // Metadata about the buffer.
+    meta: RefCell<MetaBuf>,
+}
+
+impl SharedBuf {
+    fn alloc(capacity: usize) -> SharedBuf {
+        SharedBuf {
+            data: Vec::with_capacity(capacity),
+            meta: RefCell::new(MetaBuf {
+                is_consumed: false,
+                is_eof: false,
+                byte_off: 0,
+                pos: Pos::default(),
+                err: None,
+            }),
+        }
+    }
+}
+
+pub struct Buf<'a> {
+    shared: Rc<SharedBuf>,
+    data_ref: &'a Vec<u8>,
+    meta_copy: MetaBuf,
+    tok: Tok<'a>,
+}
+
+impl<'a> Buf<'a> {
+    fn next(&mut self) -> bool {
+        if self.meta_copy.is_consumed {
+            false
+        } else {
+            let i = self.meta_copy.byte_off;
+            let n = self.data_ref.len();
+            if i == n {
+                self.tok = Tok::End("");
+                self.meta_copy.is_consumed = true;
+            } else if self.meta_copy.err.is_some() {
+                self.err(self.meta_copy.err.as_ref().unwrap().clone());
+            } else {
+                let byte_off = self.meta_copy.pos.byte_off;
+                let x = self.data_ref[i];
+                match x {
+                    // Separators.
+                    b'{' => self.sep('{'),
+                    b'}' => self.sep('}'),
+                    b'[' => self.sep('['),
+                    b']' => self.sep(']'),
+                    b',' => self.sep(','),
+                    b':' => self.sep(':'),
+                    // String literals.
+                    b'"' => self.str(),
+                    // Number literals.
+                    b'-' => self.num_unsigned(1),
+                    b'0' => self.num_zero(),
+                    b'1'..b'9' => self.num_unsigned(0),
+                    // Keywords.
+                    b'f' => self.key(b"false"),
+                    b't' => self.key(b"true"),
+                    b'n' => self.key(b"null"),
+                    // Whitespace.
+                    b'\t' | b'\n' | b'\r' | b' ' => self.white(),
+                    // Error.
+                    _ => self.err_lex(format!("unexpected {}", describe_octet(x))),
+                }
+                self.meta_copy.byte_off += (self.meta_copy.pos.byte_off - byte_off) as usize;
+            }
+            true
+        }
+    }
+
+    fn tok(&self) -> &'a Tok {
+        &self.tok
     }
 
     fn pos(&self) -> Pos {
-        self.pos
+        self.meta_copy.pos
+    }
+
+    fn sep(&mut self, sep: char) {
+        self.tok = Tok::Sep(sep);
+        Buf::advance_bytes(&mut self.meta_copy.pos, 1);
+    }
+
+    fn str(&mut self) {
+        // TODO: This is the hardest one because you have to handle escapes AND utf-8.
+    }
+
+    fn num_zero(&mut self) {
+        let i = self.meta_copy.byte_off + 1;
+        let n = self.data_ref.len();
+        if i < n {
+            // Zero encountered before end of buffer. Peek the next character to decide if there's a
+            // valid token or an error.
+            let x = self.data_ref[i];
+            match x {
+                b'\t' | b'\n' | b'\r' | b' ' | b'{' | b'}' | b'[' | b']' | b',' | b':' | b'"' => (),
+                _ => {
+                    self.err_lex(format!(
+                        "unexpected {} in number after '0'",
+                        describe_octet(x)
+                    ));
+                    return;
+                }
+            }
+        } else if !self.meta_copy.is_eof {
+            // Zero encountered at end of buffer. Need to see more input to decide if there's a
+            // valid token or an error.
+            self.end();
+            return;
+        }
+        // At this point, we know we have a valid zero token.
+        Buf::advance_bytes(&mut self.meta_copy.pos, 1);
+        self.tok = Tok::Num("0");
+    }
+
+    fn num_unsigned(&mut self, offset: usize) {
+        // TODO: offset tells us how far from byte_off to start looking for the real number.
+    }
+
+    fn key(&mut self, key: &'static [u8]) {
+        let mut i = 1;
+        let m = key.len();
+        let mut j = self.meta_copy.byte_off + 1;
+        let n = self.data_ref.len();
+        loop {
+            if j == n && !self.meta_copy.is_eof {
+                // Need more imput.
+                self.end();
+                break;
+            } else if j == n {
+                // Lexical error: unexpected end of input while expecting keyword.
+                self.err_lex(format!(
+                    "unexpected end of input while expecting {} for keyword {}",
+                    key[i] as char,
+                    std::str::from_utf8(key).unwrap()
+                ));
+                break;
+            } else if key[i] != self.data_ref[j] {
+                // Lexical error: unexpected byte while expecting keyword.
+                self.err_lex(format!(
+                    "unexpected {} while expecting {} for keyword {}",
+                    describe_octet(self.data_ref[j]),
+                    key[i],
+                    std::str::from_utf8(key).unwrap()
+                ));
+                break;
+            } else if i + 1 < m {
+                // Valid character.
+                i = i + 1;
+                j = j + 1;
+            } else {
+                // Keyword match.
+                Buf::advance_bytes(&mut self.meta_copy.pos, m);
+                self.tok = Tok::Key(unsafe { std::str::from_utf8_unchecked(key) });
+                break;
+            }
+        }
+    }
+
+    fn white(&mut self) {
+        let n = self.data_ref.len();
+        let mut i = self.meta_copy.byte_off;
+        let mut j = i;
+        let mut pos = self.meta_copy.pos;
+        loop {
+            let x = self.data_ref[j];
+            match x {
+                b'\t' | b' ' => {
+                    j = j + 1;
+                }
+                b'\n' => {
+                    j = j + 1;
+                    Buf::advance_line(&mut pos, j - i);
+                    i = j;
+                }
+                b'\r' => {
+                    if j + 1 < n && self.data_ref[j + 1] == b'\n' {
+                        // Treat CR/LF pair as a new line.
+                        j = j + 2;
+                        Buf::advance_line(&mut pos, j - i);
+                        i = j;
+                    } else if j + 1 < n || self.meta_copy.is_eof {
+                        // Treat CR by itself as a new line.
+                        j = j + 1;
+                        Buf::advance_line(&mut pos, j - i);
+                        i = j;
+                    } else {
+                        // CR is at the end of buffer. Wait for more input to handle it.
+                        self.end();
+                        return;
+                    }
+                }
+                _ => {
+                    Buf::advance_bytes(&mut pos, j - i);
+                    self.meta_copy.pos = pos;
+                    self.tok = Tok::White(self.slice_unchecked(self.meta_copy.byte_off, j));
+                    return;
+                }
+            }
+            if j == n {
+                self.end();
+                return;
+            }
+        }
+    }
+
+    fn end(&mut self) {
+        self.tok = Tok::End(self.slice_unchecked(self.meta_copy.byte_off, self.data_ref.len()));
+        self.meta_copy.is_consumed = true;
+    }
+
+    fn err_lex(&mut self, desc: String) {
+        self.err(Error {
+            cat: ErrorCat::Lex,
+            desc: desc,
+            pos: self.meta_copy.pos,
+            source: None,
+        })
+    }
+
+    fn err(&mut self, err: Error) {
+        self.tok = Tok::Err(err);
+        self.meta_copy.is_consumed = true;
+    }
+
+    fn advance_bytes(pos: &mut Pos, num_bytes: usize) {
+        pos.byte_off += num_bytes as u64;
+        pos.byte_off += num_bytes as u64;
+        pos.col += num_bytes as u64;
+    }
+
+    fn advance_line(pos: &mut Pos, num_bytes: usize) {
+        pos.byte_off += num_bytes as u64;
+        pos.col = 0;
+        pos.line += 1;
+    }
+
+    fn slice_unchecked(&self, i: usize, j: usize) -> &'a str {
+        let slice = &self.data_ref[i..j];
+        unsafe { std::str::from_utf8_unchecked(slice) }
+    }
+
+    //fn str(&self, )
+}
+
+impl<'a> Drop for Buf<'a> {
+    fn drop(&mut self) {
+        let mut meta = self.shared.meta.borrow_mut();
+        *meta = self.meta_copy.clone();
     }
 }
 
-struct LexBuf {}
+// impl<R> Stream for Lex<R>
+// where
+//     R: Read,
+// {
+//     fn next(&mut self) -> Option<impl Buf> {
+//         // Logic:
+//         // 1) If there is a buffer out in use, we panic and say it needs to be
+//         //    returned.
+//         // 2) If there is no buffer at all, we have to allocate it.
+//         // 3) Upon being returned (elsewhere), if buffer was NOT fully used then
+//         //    we are quietly put into an error state that will trigger a panic
+//         //    here. If it was fully used, then incomplete remainder is now copied
+//         //    to the front of the buffer. If incomplete remaindert WAS at the
+//         //    front of the buffer, then we have to allocate a bigger buffer.
+//     }
 
-impl LexBuf {}
+//     fn pos(&self) -> Pos {
+//         self.pos
+//     }
+// }
 
-impl Buf for LexBuf {}
-
-pub struct Syn<R>
-where
-    R: Read,
-{
-    lex: Lex<R>,
-}
-
-impl<R> Syn<R>
-where
-    R: Read,
-{
-    fn builder() -> SynBuilder<R> {
-        SynBuilder { lex: None }
+fn describe_octet(octet: u8) -> String {
+    if octet <= 0x7f {
+        format!("character {}", octet as char)
+    } else {
+        format!("octet {:02x}", octet)
     }
 }
-
-struct SynBuilder<R>
-where
-    R: Read,
-{
-    lex: Option<Lex<R>>,
-}
-
-impl<R> SynBuilder<R>
-where
-    R: Read,
-{
-    pub fn reader(mut self, lex: Lex<R>) -> Self {
-        self.lex = Some(lex);
-        self
-    }
-
-    pub fn build(self) -> Syn<R> {}
-}
-
-impl Stream for Syn {
-    fn next(&mut self) -> Option<impl Buf> {}
-
-    fn pos(&self) -> Pos {
-        self.pos
-    }
-}
-
-struct SynBuf {}
-
-impl Buf for SynBuf {}
 
 #[cfg(test)]
 mod tests {

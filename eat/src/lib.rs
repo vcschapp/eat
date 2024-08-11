@@ -486,9 +486,9 @@ impl<'a> Buf<'a> {
                     // String literals.
                     b'"' => self.str(),
                     // Number literals.
-                    b'-' => self.num_unsigned(1),
+                    b'-' => self.num_signed(),
                     b'0' => self.num_zero(),
-                    b'1'..b'9' => self.num_unsigned(0),
+                    b'1'..=b'9' => self.num_integer(1),
                     // Keywords.
                     b'f' => self.key(b"false"),
                     b't' => self.key(b"true"),
@@ -518,7 +518,149 @@ impl<'a> Buf<'a> {
     }
 
     fn str(&mut self) {
-        // TODO: This is the hardest one because you have to handle escapes AND utf-8.
+        let mut i = self.meta_copy.byte_off + 1;
+        let n = self.data_ref.len();
+        loop {
+            if i == n && !self.meta_copy.is_eof {
+                self.end();
+            } else if i == n {
+                self.err_lex(String::from("expected string character, got EOF"));
+            } else {
+                let x = self.data_ref[i];
+                match x {
+                    b'"' => {
+                        self.tok = Tok::Num(self.slice_unchecked(self.meta_copy.byte_off, i + 1));
+                        Buf::advance_bytes(
+                            &mut self.meta_copy.pos,
+                            i + 1 - self.meta_copy.byte_off,
+                        );
+                        return;
+                    }
+                    b'\\' => {
+                        if self.str_escape(&mut i) {
+                            return;
+                        }
+                    }
+                    0..b' ' => {
+                        self.err_lex(format!("{} not allowed in string", describe_octet(x)));
+                        return;
+                    }
+                    b' '..b'"' | b'#'..b'\\' | b']'..=0x7f => i = i + 1,
+                    0x80..0xc2 | 0xf5..=0xff => {
+                        self.err_lex(format!(
+                            "{} not allowed as first byte of a UTF-8 character",
+                            describe_octet(8)
+                        ));
+                        return;
+                    }
+                    0xc2..0xe0 => {
+                        if !self.str_multibyte(&mut i, 1) {
+                            return;
+                        }
+                    }
+                    0xe0..0xf0 => {
+                        if !self.str_multibyte(&mut i, 2) {
+                            return;
+                        }
+                    }
+                    0xf0..0xf5 => {
+                        if !self.str_multibyte(&mut i, 3) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn str_escape(&mut self, i: &mut usize) -> bool {
+        *i += 1;
+        let n = self.data_ref.len();
+        // Determine type of escape sequence.
+        if *i == n && !self.meta_copy.is_eof {
+            self.end();
+            return false;
+        } else if *i == n {
+            self.err_lex(String::from(
+                "unfinished escape sequence in string, got EOF",
+            ));
+            return false;
+        } else {
+            let x = self.data_ref[*i];
+            match x {
+                b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {
+                    *i += 1;
+                    return true;
+                }
+                b'u' => (),
+                _ => {
+                    self.err_lex(format!(
+                        "invalid {} in string escape sequence after '\\'",
+                        describe_octet(x)
+                    ));
+                    return false;
+                }
+            }
+        }
+        // Handle unicode escape sequence.
+        for j in 0..4 {
+            *i += 1;
+            if *i == n && !self.meta_copy.is_eof {
+                self.end();
+                return false;
+            } else if *i == n {
+                self.err_lex(String::from(
+                    "unfinished \\u unicode escape sequence in string, got EOF",
+                ));
+                return false;
+            } else {
+                let x = self.data_ref[*i];
+                match x {
+                    b'0'..=b'9' | b'A'..=b'F' | b'a'..=b'f' => (),
+                    _ => {
+                        self.err_lex(format!(
+                            "invalid {} in string \\u unicode escape sequence",
+                            describe_octet(x)
+                        ));
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    fn str_multibyte(&mut self, i: &mut usize, rem: usize) -> bool {
+        let n = self.data_ref.len();
+        for j in 0..rem {
+            *i += 1;
+            if *i == n && !self.meta_copy.is_eof {
+                self.end();
+                return false;
+            } else if *i == n {
+                self.err_lex(format!(
+                    "unfinished {}-byte UTF-8 sequence, got EOF after byte #{}",
+                    rem + 1,
+                    j + 1
+                ));
+                return false;
+            } else {
+                let x = self.data_ref[*i];
+                match x {
+                    0x80..0xc0 => (),
+                    _ => {
+                        self.err_lex(format!(
+                            "invalid {} in {}-byte UTF-8 sequence byte #{}",
+                            describe_octet(x),
+                            rem + 1,
+                            j + 1
+                        ));
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
     }
 
     fn num_zero(&mut self) {
@@ -549,8 +691,169 @@ impl<'a> Buf<'a> {
         self.tok = Tok::Num("0");
     }
 
-    fn num_unsigned(&mut self, offset: usize) {
-        // TODO: offset tells us how far from byte_off to start looking for the real number.
+    fn num_signed(&mut self) {
+        let i = self.meta_copy.byte_off + 1;
+        let n = self.data_ref.len();
+        if i == n && !self.meta_copy.is_eof {
+            self.end();
+        } else if i == n {
+            self.err_lex(String::from(
+                "expected '1'..'9' after '-' in signed number, got EOF",
+            ));
+        } else {
+            let x = self.data_ref[i];
+            match x {
+                b'1'..=b'9' => self.num_integer(2),
+                _ => self.err_lex(format!(
+                    "expected '1'..'9' after '-' in signed number, got {}",
+                    describe_octet(x)
+                )),
+            }
+        }
+    }
+
+    fn num_integer(&mut self, offset: usize) {
+        let mut i = self.meta_copy.byte_off + offset;
+        let n = self.data_ref.len();
+        loop {
+            if i == n && !self.meta_copy.is_eof {
+                self.end();
+                return;
+            } else if i == n {
+                break;
+            } else {
+                let x = self.data_ref[i];
+                match x {
+                    b'0'..=b'9' => i += 1,
+                    b'.' => return self.num_fraction(i - self.meta_copy.byte_off + 1),
+                    b'e' | b'E' => return self.num_exponent(i - self.meta_copy.byte_off + 1),
+                    b'{' | b'}' | b'[' | b']' | b',' | b':' | b'"' => break,
+                    _ => {
+                        return self.err_lex(format!(
+                            "expected '0'..'9' in number integer part, got {}",
+                            describe_octet(x)
+                        ))
+                    }
+                }
+            }
+        }
+        self.tok = Tok::Num(self.slice_unchecked(self.meta_copy.byte_off, i));
+        Buf::advance_bytes(&mut self.meta_copy.pos, i - self.meta_copy.byte_off);
+    }
+
+    fn num_fraction(&mut self, offset: usize) {
+        let mut i = self.meta_copy.byte_off + offset;
+        let n = self.data_ref.len();
+        // At least one digit is required in the fractional part.
+        if i == n && !self.meta_copy.is_eof {
+            self.end();
+            return;
+        } else if i == n {
+            self.err_lex(String::from(
+                "expected '0'..'9' in number fractional part, got EOF",
+            ));
+            return;
+        }
+        let x = self.data_ref[i];
+        match x {
+            b'0'..=b'9' => i += 1,
+            _ => {
+                self.err_lex(format!(
+                    "expected '0'..'9' in number fractional part, got {}",
+                    describe_octet(x)
+                ));
+                return;
+            }
+        }
+        // Fetch remaining optional digits.
+        loop {
+            if i == n && !self.meta_copy.is_eof {
+                self.end();
+                return;
+            } else if i == n {
+                break;
+            } else {
+                let x = self.data_ref[i];
+                match x {
+                    b'0'..=b'9' => i += 1,
+                    b'e' | b'E' => return self.num_exponent(i - self.meta_copy.byte_off + 1),
+                    b'{' | b'}' | b'[' | b']' | b',' | b':' | b'"' => break,
+                    _ => {
+                        return self.err_lex(format!(
+                            "expected '0'..'9' in number fractional part, got {}",
+                            describe_octet(x)
+                        ))
+                    }
+                }
+            }
+        }
+        self.tok = Tok::Num(self.slice_unchecked(self.meta_copy.byte_off, i));
+        Buf::advance_bytes(&mut self.meta_copy.pos, i - self.meta_copy.byte_off);
+    }
+
+    fn num_exponent(&mut self, offset: usize) {
+        let mut i = self.meta_copy.byte_off + offset;
+        let n = self.data_ref.len();
+        // An optional +/- is allowed.
+        if i == n && !self.meta_copy.is_eof {
+            self.end();
+            return;
+        } else if i == n {
+            self.err_lex(String::from(
+                "expected '+', '-', or '0'..'9' in number exponent, got EOF",
+            ));
+            return;
+        }
+        let x = self.data_ref[i];
+        match x {
+            b'+' | b'-' => i += 1,
+            b'0'..=b'9' => (),
+            _ => self.err_lex(format!(
+                "expected '+', '-', or '0'..'9' in number exponent, got {}",
+                describe_octet(x)
+            )),
+        }
+        // At least one digit is required.
+        if i == n && !self.meta_copy.is_eof {
+            self.end();
+            return;
+        } else if i == n {
+            self.err_lex(String::from(
+                "expected '0'..'9' in number exponent, got EOF",
+            ));
+            return;
+        }
+        let x = self.data_ref[i];
+        match x {
+            b'0'..=b'9' => i += 1,
+            _ => self.err_lex(format!(
+                "expected '0'..'9' in number exponent, got {}",
+                describe_octet(x)
+            )),
+        }
+        // Fetch remaining optional digits.
+        loop {
+            if i == n && !self.meta_copy.is_eof {
+                self.end();
+                return;
+            } else if i == n {
+                break;
+            } else {
+                let x = self.data_ref[i];
+                match x {
+                    b'0'..=b'9' => i += 1,
+                    b'{' | b'}' | b'[' | b']' | b',' | b':' | b'"' => break,
+                    _ => {
+                        return self.err_lex(format!(
+                            "expected '0'..'9' in number exponent, got {}",
+                            describe_octet(x)
+                        ))
+                    }
+                }
+            }
+        }
+        self.tok = Tok::Num(self.slice_unchecked(self.meta_copy.byte_off, i));
+        Buf::advance_bytes(&mut self.meta_copy.pos, i - self.meta_copy.byte_off);
     }
 
     fn key(&mut self, key: &'static [u8]) {
@@ -708,10 +1011,13 @@ impl<'a> Drop for Buf<'a> {
 // }
 
 fn describe_octet(octet: u8) -> String {
-    if octet <= 0x7f {
-        format!("character {}", octet as char)
-    } else {
-        format!("octet {:02x}", octet)
+    match octet {
+        b'\t' => String::from("control character 0x09 ('\t')"),
+        b'\n' => String::from("control character 0x0a ('\n')"),
+        b'\r' => String::from("control character 0x0a ('\r')"),
+        0..b' ' => format!("control characer 0x{:02x}", octet),
+        b' '..0x80 => format!("character '{}'", octet as char),
+        _ => format!("octet 0x{:02x}", octet),
     }
 }
 

@@ -6,11 +6,6 @@ use std::fmt;
 use std::io::Read;
 use std::rc::Rc;
 
-// TODO: Delete
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
-
 /// Opening brace, the JSON separator that denotes the start an object value.
 pub static SEP_BRACE_O: char = '{';
 
@@ -42,9 +37,15 @@ pub static KEY_NULL: &str = "null";
 /// the [Stream], not the [Buf].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Pos {
+    /// Offset of this position from the start of the stream in bytes.
     pub byte_off: u64,
+    /// Offset of this position from the start of the stream in UTF-8 characters.
     pub char_off: u64,
+    /// Line number of this position relative to the start of the stream. This value is zero-based,
+    /// so the first line number is `0`.
     pub line: u64,
+    /// Column number of this position relative to the start of the line it is on. This value is
+    /// zero-based, so the first column number is `0`.
     pub col: u64,
 }
 
@@ -118,13 +119,25 @@ pub enum Tok<'a> {
     /// Contains the number value literally as it appears in the JSON input.
     Num(&'a str),
 
-    /// String token.
+    /// String token without escape sequence.
     ///
     /// Contains the string value literally as it appears in the JSON input, including the opening
     /// and closing double quotation mark (`"`).
     ///
+    /// String tokens that contain escape sequences are returned as [Tok::StrEsc].
+    ///
     /// Examples: `""`, `"foo"`
     Str(&'a str),
+
+    /// String token containing an escape sequence.
+    ///
+    /// Contains the string value literally as it appears in the JSON input, including the opening
+    /// and closing double quotation mark (`"`).
+    ///
+    /// String tokens that do not contain escape sequences are returned as [Tok::Str].
+    ///
+    /// Examples: `"\n"`, `"Up there: \ud83d\udc46"`
+    StrEsc(&'a str),
 
     /// Keyword token.
     ///
@@ -154,21 +167,21 @@ pub enum Tok<'a> {
     Err(Error),
 }
 
-/// Default value for the initial capacity of a [Buf], in bytes. This
-/// value will be used as the starting buffer size in a [Stream] unless
-/// overridden with [StreamBuilder::init_buf_len].
+/// Default value for the initial capacity of a [Buf], in bytes. This value will be used as the
+/// starting buffer size in a [Stream] unless overridden with [StreamBuilder::init_buf_len].
 const DEFAULT_INIT_BUF_LEN: usize = 4 * 1024;
 
-/// Default value for the maximum capacity of a [Buf], in bytes. This
-/// will be used as the maximum possible buffer size in a [Stream]
-/// unless overridden with [StreamBuilder::max_buf_len].
+/// Default value for the maximum capacity of a [Buf], in bytes. This will be used as the maximum
+/// possible buffer size in a [Stream] unless overridden with [StreamBuilder::max_buf_len].
 const DEFAULT_MAX_BUF_LEN: usize = 8 * 1024 * 1024;
 
-/// Maximum possible value for the maximum capacity of a [Buf], in
-/// bytes.
+/// Minimum possible value for the initial capacity of a [Buf], in bytes.
+const MIN_INIT_BUF_LEN: usize = 1024;
+
+/// Maximum possible value for the maximum capacity of a [Buf], in bytes.
 const MAX_MAX_BUF_LEN: usize = isize::MAX as usize;
 
-pub struct Stream<R>
+pub struct Lex<R>
 where
     R: Read,
 {
@@ -177,13 +190,13 @@ where
     max_buf_len: usize,
 }
 
-impl<R> Stream<R>
+impl<R> Lex<R>
 where
     R: Read,
 {
     /// Returns a new builder that can be used to build a stream.
-    pub fn builder() -> StreamBuilder<R> {
-        StreamBuilder {
+    pub fn builder() -> LexBuilder<R> {
+        LexBuilder {
             reader: None,
             init_buf_len: DEFAULT_INIT_BUF_LEN,
             max_buf_len: DEFAULT_MAX_BUF_LEN,
@@ -231,7 +244,7 @@ where
             return false;
         }
         // Read more input.
-        Stream::<R>::read(&mut self.reader, data, &mut *meta, self.max_buf_len);
+        Lex::<R>::read(&mut self.reader, data, &mut *meta, self.max_buf_len);
         // Indicate that there is more input to consume.
         true
     }
@@ -322,7 +335,7 @@ where
 
     fn read(reader: &mut R, data: &mut Vec<u8>, meta: &mut MetaBuf, max_buf_len: usize) {
         // Move unconsumed bytes to the left and, if necessary, enlarge buffer.
-        let rem = match Stream::<R>::shift(data, meta, max_buf_len) {
+        let rem = match Lex::<R>::shift(data, meta, max_buf_len) {
             Ok(rem) => rem,
             Err(e) => {
                 meta.err = Some(e);
@@ -351,7 +364,7 @@ where
     }
 }
 
-pub struct StreamBuilder<R>
+pub struct LexBuilder<R>
 where
     R: Read,
 {
@@ -360,7 +373,7 @@ where
     max_buf_len: usize,
 }
 
-impl<R> StreamBuilder<R>
+impl<R> LexBuilder<R>
 where
     R: Read,
 {
@@ -370,8 +383,11 @@ where
     }
 
     pub fn init_buf_len(mut self, init_buf_len: usize) -> Self {
-        if init_buf_len < 1 {
-            panic!("init_buf_len must be positive");
+        if init_buf_len < MIN_INIT_BUF_LEN {
+            panic!(
+                "init_buf_len must be at at least MIN_INIT_BUF_LEN, but {} < {}",
+                init_buf_len, MIN_INIT_BUF_LEN
+            );
         } else if init_buf_len > self.max_buf_len {
             panic!(
                 "init_buf_len must not exceed max_buf_len, but {} > {}",
@@ -398,8 +414,8 @@ where
         self
     }
 
-    pub fn build(self) -> Stream<R> {
-        Stream {
+    pub fn build(self) -> Lex<R> {
+        Lex {
             reader: self.reader.expect("reader not provided"),
             shared: Rc::new(SharedBuf::alloc(self.init_buf_len)),
             max_buf_len: self.max_buf_len,
@@ -520,6 +536,8 @@ impl<'a> Buf<'a> {
     fn str(&mut self) {
         let mut i = self.meta_copy.byte_off + 1;
         let n = self.data_ref.len();
+        let mut pos = self.meta_copy.pos;
+        let mut esc = false;
         loop {
             if i == n && !self.meta_copy.is_eof {
                 self.end();
@@ -529,17 +547,16 @@ impl<'a> Buf<'a> {
                 let x = self.data_ref[i];
                 match x {
                     b'"' => {
-                        self.tok = Tok::Num(self.slice_unchecked(self.meta_copy.byte_off, i + 1));
-                        Buf::advance_bytes(
-                            &mut self.meta_copy.pos,
-                            i + 1 - self.meta_copy.byte_off,
-                        );
+                        let s = self.slice_unchecked(self.meta_copy.byte_off, i + 1);
+                        self.tok = if !esc { Tok::Str(s) } else { Tok::StrEsc(s) };
+                        self.meta_copy.pos = pos;
                         return;
                     }
                     b'\\' => {
-                        if self.str_escape(&mut i) {
+                        if self.str_esc(&mut i, &mut pos) {
                             return;
                         }
+                        esc = true;
                     }
                     0..b' ' => {
                         self.err_lex(format!("{} not allowed in string", describe_octet(x)));
@@ -557,23 +574,26 @@ impl<'a> Buf<'a> {
                         if !self.str_multibyte(&mut i, 1) {
                             return;
                         }
+                        Buf::advance_char(&mut pos, 2);
                     }
                     0xe0..0xf0 => {
                         if !self.str_multibyte(&mut i, 2) {
                             return;
                         }
+                        Buf::advance_char(&mut pos, 3);
                     }
                     0xf0..0xf5 => {
                         if !self.str_multibyte(&mut i, 3) {
                             return;
                         }
+                        Buf::advance_char(&mut pos, 4);
                     }
                 }
             }
         }
     }
 
-    fn str_escape(&mut self, i: &mut usize) -> bool {
+    fn str_esc(&mut self, i: &mut usize, pos: &mut Pos) -> bool {
         *i += 1;
         let n = self.data_ref.len();
         // Determine type of escape sequence.
@@ -590,6 +610,7 @@ impl<'a> Buf<'a> {
             match x {
                 b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {
                     *i += 1;
+                    Buf::advance_bytes(pos, 2);
                     return true;
                 }
                 b'u' => (),
@@ -603,7 +624,7 @@ impl<'a> Buf<'a> {
             }
         }
         // Handle unicode escape sequence.
-        for j in 0..4 {
+        for _ in 0..4 {
             *i += 1;
             if *i == n && !self.meta_copy.is_eof {
                 self.end();
@@ -627,6 +648,7 @@ impl<'a> Buf<'a> {
                 }
             }
         }
+        Buf::advance_bytes(pos, 6);
         return true;
     }
 
@@ -964,12 +986,19 @@ impl<'a> Buf<'a> {
 
     fn advance_bytes(pos: &mut Pos, num_bytes: usize) {
         pos.byte_off += num_bytes as u64;
-        pos.byte_off += num_bytes as u64;
+        pos.char_off += num_bytes as u64;
         pos.col += num_bytes as u64;
+    }
+
+    fn advance_char(pos: &mut Pos, num_bytes: usize) {
+        pos.byte_off += num_bytes as u64;
+        pos.char_off += 1;
+        pos.col += 1;
     }
 
     fn advance_line(pos: &mut Pos, num_bytes: usize) {
         pos.byte_off += num_bytes as u64;
+        pos.char_off += num_bytes as u64;
         pos.col = 0;
         pos.line += 1;
     }
@@ -989,27 +1018,6 @@ impl<'a> Drop for Buf<'a> {
     }
 }
 
-// impl<R> Stream for Lex<R>
-// where
-//     R: Read,
-// {
-//     fn next(&mut self) -> Option<impl Buf> {
-//         // Logic:
-//         // 1) If there is a buffer out in use, we panic and say it needs to be
-//         //    returned.
-//         // 2) If there is no buffer at all, we have to allocate it.
-//         // 3) Upon being returned (elsewhere), if buffer was NOT fully used then
-//         //    we are quietly put into an error state that will trigger a panic
-//         //    here. If it was fully used, then incomplete remainder is now copied
-//         //    to the front of the buffer. If incomplete remaindert WAS at the
-//         //    front of the buffer, then we have to allocate a bigger buffer.
-//     }
-
-//     fn pos(&self) -> Pos {
-//         self.pos
-//     }
-// }
-
 fn describe_octet(octet: u8) -> String {
     match octet {
         b'\t' => String::from("control character 0x09 ('\t')"),
@@ -1023,11 +1031,91 @@ fn describe_octet(octet: u8) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+    mod lex {
+        mod builder {
+            use super::super::super::*;
+            use std::io::Cursor;
+
+            #[test]
+            #[should_panic(
+                expected = "init_buf_len must be at at least MIN_INIT_BUF_LEN, but 0 < 1024"
+            )]
+            fn panic_init_buf_len_too_small() {
+                let b = Lex::<Cursor<&str>>::builder();
+
+                b.init_buf_len(0);
+            }
+
+            #[test]
+            #[should_panic(
+                expected = "init_buf_len must not exceed max_buf_len, but 8388609 > 8388608"
+            )]
+            fn panic_init_buf_len_too_large_default_max() {
+                let b = Lex::<Cursor<&str>>::builder();
+
+                b.init_buf_len(DEFAULT_MAX_BUF_LEN + 1);
+            }
+
+            #[test]
+            #[should_panic(expected = "init_buf_len must not exceed max_buf_len, but 1025 > 1024")]
+            fn panic_init_buf_len_too_large_smaller_max() {
+                let b = Lex::<Cursor<&str>>::builder()
+                    .init_buf_len(MIN_INIT_BUF_LEN)
+                    .max_buf_len(MIN_INIT_BUF_LEN);
+
+                b.init_buf_len(MIN_INIT_BUF_LEN + 1);
+            }
+
+            #[test]
+            #[should_panic(
+                expected = "init_buf_len must not exceed max_buf_len, but 9223372036854775808 > 9223372036854775807"
+            )]
+            fn panic_init_buf_len_too_large_larger_max() {
+                let b = Lex::<Cursor<&str>>::builder().max_buf_len(MAX_MAX_BUF_LEN);
+
+                b.init_buf_len(MAX_MAX_BUF_LEN + 1);
+            }
+
+            #[test]
+            #[should_panic(
+                expected = "max_buf_len must not be less than init_buf_len, but 4095 < 4096"
+            )]
+            fn panic_max_buf_len_too_small_default_init() {
+                let b = Lex::<Cursor<&str>>::builder();
+
+                b.max_buf_len(DEFAULT_INIT_BUF_LEN - 1);
+            }
+
+            #[test]
+            #[should_panic(
+                expected = "max_buf_len must not be less than init_buf_len, but 1023 < 1024"
+            )]
+            fn panic_max_buf_len_too_small_smaller_init() {
+                let b = Lex::<Cursor<&str>>::builder().init_buf_len(MIN_INIT_BUF_LEN);
+
+                b.max_buf_len(MIN_INIT_BUF_LEN - 1);
+            }
+
+            #[test]
+            #[should_panic(
+                expected = "max_buf_len must not be less than init_buf_len, but 8191 < 8192"
+            )]
+            fn panic_max_buf_len_too_small_larger_init() {
+                let b = Lex::<Cursor<&str>>::builder()
+                    .max_buf_len(2 * DEFAULT_INIT_BUF_LEN)
+                    .init_buf_len(2 * DEFAULT_INIT_BUF_LEN);
+
+                b.max_buf_len(2 * DEFAULT_INIT_BUF_LEN - 1);
+            }
+
+            #[test]
+            #[should_panic(expected = "reader not provided")]
+            fn panic_build_no_reader() {
+                let b = Lex::<Cursor<&str>>::builder();
+
+                b.build();
+            }
+        }
     }
 }

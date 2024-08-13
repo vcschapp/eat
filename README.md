@@ -6,14 +6,18 @@ blazejson
 blitzjson
 emblazon
 gorge
-ripjson **TAKEN**
-sprayson
-squall
+lightjson
+litejson
+minijson
 shredjson
+shriek
+squall
 
 bleep
 chinook
 chew
 devour
 inhale
+ripjson **TAKEN**
 spitball
+sprayson

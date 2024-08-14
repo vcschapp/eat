@@ -72,14 +72,14 @@ pub enum ErrorCat {
 /// ([ErrorCat::Read]) or a lexical error when tokenizing the JSON
 /// ([ErrorCat::Lex]).
 #[derive(Debug, Clone)]
-pub struct Error {
+pub struct TokError {
     pub cat: ErrorCat,
     pub desc: String,
     pub pos: Pos,
     source: Option<Rc<dyn error::Error + 'static>>,
 }
 
-impl fmt::Display for Error {
+impl fmt::Display for TokError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let prefix = match self.cat {
             ErrorCat::Read => "read",
@@ -93,7 +93,7 @@ impl fmt::Display for Error {
     }
 }
 
-impl error::Error for Error {
+impl error::Error for TokError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         self.source.as_ref().map(|rc| rc.as_ref())
     }
@@ -164,7 +164,7 @@ pub enum Tok<'a> {
     ///
     /// Indicates that a lexical or syntactic error was detected. Includes the error details,
     /// including its position within the buffer.
-    Err(Error),
+    Err(TokError),
 }
 
 /// Default value for the initial capacity of a [Buf], in bytes. This value will be used as the
@@ -287,7 +287,11 @@ where
     }
 
     // Moves unconsumed bytes to the front of the data buffer and tries to resize it as necessary.
-    fn shift(data: &mut Vec<u8>, meta: &mut MetaBuf, max_buf_len: usize) -> Result<usize, Error> {
+    fn shift(
+        data: &mut Vec<u8>,
+        meta: &mut MetaBuf,
+        max_buf_len: usize,
+    ) -> Result<usize, TokError> {
         // Count the unconsumed remainder bytes.
         let rem = data.len() - meta.byte_off;
         // Move any unconsumed data to the front.
@@ -303,7 +307,7 @@ where
                 // Expand the buffer. If it fails, return error message that prevented the buffer
                 // being expanded.
                 data.try_reserve(new_capacity)
-                    .map_err(|e: TryReserveError| Error {
+                    .map_err(|e: TryReserveError| TokError {
                         cat: ErrorCat::Read,
                         desc: String::from("failed to expand buffer"),
                         pos: meta.pos,
@@ -319,7 +323,7 @@ where
                     "can't make progress with maxxed buffer of {} bytes (likely due to an offensively long string or number token)",
                     data.capacity()
                 );
-                return Err(Error {
+                return Err(TokError {
                     cat: ErrorCat::Read,
                     desc: desc,
                     pos: meta.pos,
@@ -353,7 +357,7 @@ where
                 meta.is_eof = num_read == 0;
             }
             Err(e) => {
-                meta.err = Some(Error {
+                meta.err = Some(TokError {
                     cat: ErrorCat::Read,
                     desc: String::from("failed to read"),
                     pos: meta.pos,
@@ -443,7 +447,7 @@ struct MetaBuf {
 
     // Fatal error to be transferred between Stream and Buf. This allows the Stream to push a read
     // error down to the Buf and Buf to push a lexical error up to the Stream.
-    err: Option<Error>,
+    err: Option<TokError>,
 }
 
 struct SharedBuf {
@@ -971,7 +975,7 @@ impl<'a> Buf<'a> {
     }
 
     fn err_lex(&mut self, desc: String) {
-        self.err(Error {
+        self.err(TokError {
             cat: ErrorCat::Lex,
             desc: desc,
             pos: self.meta_copy.pos,
@@ -979,7 +983,7 @@ impl<'a> Buf<'a> {
         })
     }
 
-    fn err(&mut self, err: Error) {
+    fn err(&mut self, err: TokError) {
         self.tok = Tok::Err(err);
         self.meta_copy.is_consumed = true;
     }
@@ -1031,6 +1035,91 @@ fn describe_octet(octet: u8) -> String {
 
 #[cfg(test)]
 mod tests {
+    mod pos {
+        use super::super::Pos;
+
+        #[test]
+        fn display() {
+            let pos = Pos {
+                byte_off: 5,
+                char_off: 4,
+                line: 1,
+                col: 2,
+            };
+
+            let s = format!("{}", pos);
+
+            assert_eq!(s, "line 1, column 2, byte 5");
+        }
+    }
+
+    mod lex_error {
+        use super::super::ErrorCat;
+        use super::super::Pos;
+        use super::super::TokError;
+        use std::error::Error;
+        use std::rc::Rc;
+
+        #[test]
+        fn no_source_display() {
+            let err = TokError {
+                cat: ErrorCat::Lex,
+                desc: String::from("a small problem with disproportionate impact"),
+                pos: Pos::default(),
+                source: None,
+            };
+
+            let s = format!("{}", err);
+
+            assert_eq!(s, "lexical error: a small problem with disproportionate impact at line 0, column 0, byte 0");
+        }
+
+        #[test]
+        fn no_source_error() {
+            let err = TokError {
+                cat: ErrorCat::Read,
+                desc: String::from("not able to read that thing"),
+                pos: Pos::default(),
+                source: None,
+            };
+
+            assert!(err.source().is_none());
+        }
+
+        #[test]
+        fn source_display() {
+            let source: Box<dyn Error + 'static> = String::from("root cause").into();
+            let err = TokError {
+                cat: ErrorCat::Read,
+                desc: String::from("proximate cause"),
+                pos: Pos::default(),
+                source: Some(Rc::from(source)),
+            };
+
+            let s = format!("{}", err);
+
+            assert_eq!(
+                s,
+                "read error: proximate cause at line 0, column 0, byte 0: caused by root cause"
+            );
+        }
+
+        #[test]
+        fn source_error() {
+            let source: Box<dyn Error + 'static> = String::from("root cause").into();
+            let err = TokError {
+                cat: ErrorCat::Read,
+                desc: String::from("proximate cause"),
+                pos: Pos::default(),
+                source: Some(Rc::from(source)),
+            };
+
+            assert_eq!(
+                err.source().expect("source must be Some").to_string(),
+                "root cause"
+            );
+        }
+    }
 
     mod lex {
         mod builder {
